@@ -191,7 +191,10 @@ def generate_all_sites(
     config_dict: dict[str, Any] = config.model_dump()
     config_dict["output_local_dir"] = str(config_dict["output_local_dir"])
 
-    tasks = [(site.icao, zoom) for site in sites for zoom in zooms]
+    # Zoom-major: all z10 → all z11 → … → all z14.
+    # Keeps workers on fast tasks first so progress is visible early,
+    # and avoids all 45 slots being consumed by slow z14 tasks immediately.
+    tasks = [(site.icao, zoom) for zoom in zooms for site in sites]
     result = BatchResult()
     # First slot is always the live stats line; rest are event log entries
     log_lines: deque[str] = deque(maxlen=500)
