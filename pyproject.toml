@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wxalerts-nexrad-lut-gen"
+version = "0.1.0"
+description = "CLI tool to generate lookup tables for NEXRAD polar radar data"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "numpy~=2.1",
+    "pyproj~=3.7",
+    "mercantile~=1.2",
+    "shapely~=2.0",
+    "boto3~=1.35",
+    "pydantic~=2.9",
+    "pydantic-settings~=2.6",
+    "typer~=0.15",
+    "structlog~=24.4",
+    "rich~=13.9",
+]
+
+[project.scripts]
+lutgen = "lutgen.cli:app"
+
+[project.optional-dependencies]
+dev = [
+    "pytest~=8.3",
+    "pytest-cov~=5.0",
+    "ruff~=0.7",
+    "mypy~=1.13",
+    "moto[s3]~=5.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--tb=short"
