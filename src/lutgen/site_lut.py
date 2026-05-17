@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import mercantile
@@ -12,9 +13,9 @@ from lutgen.tiles import tile_pixel_lonlat, tiles_in_coverage
 
 _WEBMERC_TO_WGS84 = pyproj.Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
 
-# Tiles processed per pixel_to_polar call. Larger = fewer calls but more peak RAM.
-# At 64: ~67 MB lons+lats per worker; safe for 45 concurrent workers.
-_TILE_BATCH = 64
+# Tiles per haversine call. float32 grids keep peak RAM at ~8 MB/batch,
+# so many threads can run concurrently without OOM.
+_TILE_BATCH = 16
 
 
 @dataclass
@@ -111,14 +112,53 @@ def _prefilter_tiles(
     return [t for t, d in zip(tiles, dist, strict=True) if d <= site.max_range_m]
 
 
+def _process_batch(
+    site: Site,
+    batch: list[mercantile.Tile],
+    tile_size: int,
+) -> tuple[list[mercantile.Tile], np.ndarray, np.ndarray, np.ndarray]:
+    """Build float32 lon/lat grids for a tile batch and run haversine pixel_to_polar.
+
+    Using float32 halves intermediate memory vs float64. pixel_to_polar preserves
+    the dtype, so all trig stays in float32. numpy ufuncs release the GIL, so
+    multiple threads calling this concurrently do run in parallel.
+    """
+    nb = len(batch)
+    lons = np.empty((nb, tile_size, tile_size), dtype=np.float32)
+    lats = np.empty((nb, tile_size, tile_size), dtype=np.float32)
+    for j, tile in enumerate(batch):
+        lon, lat = tile_pixel_lonlat(tile, tile_size)
+        lons[j] = lon
+        lats[j] = lat
+    r_idx, az_idx, msk = pixel_to_polar(site, lats, lons)
+    return batch, r_idx, az_idx, msk
+
+
 def generate_site_lut(
     site: Site,
     zoom: int,
     tile_size: int = 256,
+    n_threads: int = 1,
 ) -> SiteLutResult:
-    """Generate the per-site LUT for one (site, zoom) combination."""
+    """Generate the per-site LUT for one (site, zoom) combination.
+
+    n_threads > 1 processes tile batches concurrently. numpy haversine
+    operations release the GIL so threads genuinely run in parallel.
+    """
     all_tiles = tiles_in_coverage(site, zoom)
     tiles = _prefilter_tiles(site, all_tiles)
+
+    batches = [tiles[i : i + _TILE_BATCH] for i in range(0, len(tiles), _TILE_BATCH)]
+
+    if n_threads > 1 and len(batches) > 1:
+        with ThreadPoolExecutor(max_workers=n_threads) as tex:
+            # Submit all batches; collect in submission order to preserve tile ordering.
+            batch_results = [
+                f.result()
+                for f in [tex.submit(_process_batch, site, b, tile_size) for b in batches]
+            ]
+    else:
+        batch_results = [_process_batch(site, b, tile_size) for b in batches]
 
     tile_indices: list[tuple[int, int]] = []
     range_arrays: list[np.ndarray] = []
@@ -127,17 +167,7 @@ def generate_site_lut(
     weight_arrays: list[np.ndarray] = []
     compute_weights = zoom in (8, 9)
 
-    for batch_start in range(0, len(tiles), _TILE_BATCH):
-        batch = tiles[batch_start : batch_start + _TILE_BATCH]
-        nb = len(batch)
-
-        lons = np.empty((nb, tile_size, tile_size))
-        lats = np.empty((nb, tile_size, tile_size))
-        for j, tile in enumerate(batch):
-            lons[j], lats[j] = tile_pixel_lonlat(tile, tile_size)
-
-        r_idx, az_idx, msk = pixel_to_polar(site, lats, lons)
-
+    for batch, r_idx, az_idx, msk in batch_results:
         for j, tile in enumerate(batch):
             if not msk[j].any():
                 continue

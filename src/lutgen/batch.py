@@ -51,6 +51,7 @@ def _run_site_zoom(
     zoom: int,
     config_dict: dict[str, Any],
     force: bool,
+    n_threads: int = 1,
 ) -> tuple[str, bool, str, int, float, float]:
     """Worker: generate + write one (site, zoom) LUT.
 
@@ -69,7 +70,7 @@ def _run_site_zoom(
             return label, True, "skip", 0, 0.0, 0.0
 
         t_compute = time.monotonic()
-        lut = generate_site_lut(site, zoom)
+        lut = generate_site_lut(site, zoom, n_threads=n_threads)
         compute_s = time.monotonic() - t_compute
 
         t_upload = time.monotonic()
@@ -216,7 +217,10 @@ def generate_all_sites(
     ):
         for icao, zoom in tasks:
             label = f"{icao}/z{zoom:02d}"
-            fut = pool.submit(_run_site_zoom, icao, zoom, config_dict, force)
+            # More threads for heavier zoom levels; numpy haversine releases the GIL
+            # so threads in a worker process run truly in parallel.
+            n_threads = 4 if zoom >= 13 else 2 if zoom >= 11 else 1
+            fut = pool.submit(_run_site_zoom, icao, zoom, config_dict, force, n_threads)
             in_flight[label] = (fut, time.monotonic())
 
         last_heartbeat = time.monotonic()

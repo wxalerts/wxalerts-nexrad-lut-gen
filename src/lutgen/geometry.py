@@ -66,20 +66,30 @@ def pixel_to_polar(
 
     lat_r = np.radians(pixel_lat)
     lon_r = np.radians(pixel_lon)
-    dlat = lat_r - lat0
-    dlon = lon_r - lon0
+
+    # Cast scalar constants to the array dtype so float32 inputs stay float32
+    # throughout and don't get silently upcast to float64.
+    dt = lat_r.dtype
+    _lat0     = dt.type(lat0)
+    _lon0     = dt.type(lon0)
+    _cos_lat0 = dt.type(cos_lat0)
+    _sin_lat0 = dt.type(sin_lat0)
+    _2R       = dt.type(2.0 * _EARTH_RADIUS_M)
+
+    dlat = lat_r - _lat0
+    dlon = lon_r - _lon0
 
     # Great-circle distance via Haversine
-    a = np.sin(dlat * 0.5) ** 2 + cos_lat0 * np.cos(lat_r) * np.sin(dlon * 0.5) ** 2
-    range_m = 2.0 * _EARTH_RADIUS_M * np.arcsin(np.sqrt(a.clip(0.0, 1.0)))
+    a = np.sin(dlat * 0.5) ** 2 + _cos_lat0 * np.cos(lat_r) * np.sin(dlon * 0.5) ** 2
+    range_m = _2R * np.arcsin(np.sqrt(a.clip(dt.type(0.0), dt.type(1.0))))
 
     # Forward bearing: 0° = North, clockwise — matches NEXRAD convention
     x = np.cos(lat_r) * np.sin(dlon)
-    y = cos_lat0 * np.sin(lat_r) - sin_lat0 * np.cos(lat_r) * np.cos(dlon)
-    azimuth_deg = (np.degrees(np.arctan2(x, y)) + 360.0) % 360.0
+    y = _cos_lat0 * np.sin(lat_r) - _sin_lat0 * np.cos(lat_r) * np.cos(dlon)
+    azimuth_deg = (np.degrees(np.arctan2(x, y)) + dt.type(360.0)) % dt.type(360.0)
 
-    range_idx_f = (range_m - site.first_range_gate_m) / site.range_gate_spacing_m
-    azimuth_idx_f = azimuth_deg / (360.0 / site.n_azimuths)
+    range_idx_f = (range_m - dt.type(site.first_range_gate_m)) / dt.type(site.range_gate_spacing_m)
+    azimuth_idx_f = azimuth_deg / dt.type(360.0 / site.n_azimuths)
     max_range_idx = int(
         math.floor((site.max_range_m - site.first_range_gate_m) / site.range_gate_spacing_m)
     )
@@ -87,7 +97,7 @@ def pixel_to_polar(
     range_idx = np.floor(range_idx_f).astype(np.int32)
     azimuth_idx = np.floor(azimuth_idx_f).astype(np.int32)
 
-    in_range = (range_idx >= 0) & (range_idx < max_range_idx) & (range_m <= site.max_range_m)
+    in_range = (range_idx >= 0) & (range_idx < max_range_idx) & (range_m <= dt.type(site.max_range_m))
     mask = in_range.astype(np.uint8)
     range_idx = np.where(in_range, range_idx, 0).astype(np.uint16)
     azimuth_idx = np.where(in_range, azimuth_idx % site.n_azimuths, 0).astype(np.uint16)
