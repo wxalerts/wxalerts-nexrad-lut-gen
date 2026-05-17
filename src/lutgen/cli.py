@@ -172,8 +172,18 @@ def list_sites() -> None:
 @app.command("verify")
 def verify(
     lut_file: Path = typer.Argument(..., help="Path to a .npz LUT file"),  # noqa: B008
+    site: str | None = typer.Option(None, "--site", help="ICAO site code (required for --check-geometry)"),
+    zoom: int | None = typer.Option(None, "--zoom", help="Zoom level (required for --check-geometry)"),
+    check_geometry: bool = typer.Option(False, "--check-geometry", help="Run polar geometry consistency check"),
 ) -> None:
-    """Validate the structure of a generated .npz LUT file."""
+    """Validate the structure of a generated .npz LUT file.
+
+    Add --check-geometry --site ICAO --zoom N to also verify that the stored
+    polar indices are geometrically consistent with each tile's location.
+
+    Example:
+        lutgen verify sites/KMOB/z12.npz --check-geometry --site KMOB --zoom 12
+    """
     if not lut_file.exists():
         err_console.print(f"[red]File not found: {lut_file}[/red]")
         raise typer.Exit(1)
@@ -213,5 +223,76 @@ def verify(
         for e in errors:
             err_console.print(f"[red]ERROR[/red]: {e}")
         raise typer.Exit(1)
-    else:
-        console.print("[green]OK[/green]")
+
+    console.print("[green]Structure OK[/green]")
+
+    # ── optional geometry check ───────────────────────────────────────────────
+    if check_geometry:
+        if not site or zoom is None:
+            err_console.print("[red]--check-geometry requires --site ICAO and --zoom N[/red]")
+            raise typer.Exit(1)
+        if site not in SITE_BY_ICAO:
+            err_console.print(f"[red]Unknown site: {site}[/red]")
+            raise typer.Exit(1)
+
+        import math
+        import mercantile
+        from lutgen.geometry import aeqd_transformer
+
+        site_obj    = SITE_BY_ICAO[site]
+        transformer = aeqd_transformer(site_obj)
+        tile_index  = data["tile_index"]
+        range_idx   = data["range_idx"]
+        azimuth_idx = data["azimuth_idx"]
+        mask        = data["mask"]
+
+        range_tol   = 5
+        azimuth_tol = 2
+        geo_errors: list[str] = []
+        n_checked   = 0
+
+        for row in range(tile_index.shape[0]):
+            tx, ty = int(tile_index[row, 0]), int(tile_index[row, 1])
+            m = mask[row]
+            h, w = m.shape
+            cy, cx = h // 2, w // 2
+            if m[cy, cx] == 0:
+                continue  # center pixel outside coverage — skip
+
+            bounds     = mercantile.bounds(mercantile.Tile(x=tx, y=ty, z=zoom))
+            center_lon = (bounds.west + bounds.east) / 2
+            center_lat = (bounds.south + bounds.north) / 2
+
+            x_aeqd, y_aeqd = transformer.transform(center_lon, center_lat)
+            range_m         = math.hypot(x_aeqd, y_aeqd)
+            exp_range_idx   = int(
+                (range_m - site_obj.first_range_gate_m) / site_obj.range_gate_spacing_m
+            )
+            exp_az_deg = (math.degrees(math.atan2(x_aeqd, y_aeqd)) + 360) % 360
+            exp_az_idx = int(exp_az_deg / (360.0 / site_obj.n_azimuths))
+
+            act_range = int(range_idx[row][cy, cx])
+            act_az    = int(azimuth_idx[row][cy, cx])
+
+            range_diff = abs(act_range - exp_range_idx)
+            raw_diff   = abs(act_az - exp_az_idx)
+            az_diff    = min(raw_diff, site_obj.n_azimuths - raw_diff)
+
+            n_checked += 1
+            if range_diff > range_tol:
+                geo_errors.append(
+                    f"Tile ({tx},{ty}): range expected={exp_range_idx} actual={act_range} Δ{range_diff}"
+                )
+            if az_diff > azimuth_tol:
+                geo_errors.append(
+                    f"Tile ({tx},{ty}): azimuth expected={exp_az_idx} actual={act_az} Δ{az_diff}"
+                )
+            if len(geo_errors) >= 20:
+                break
+
+        console.print(f"Geometry check: {n_checked} center-covered tiles checked")
+        if geo_errors:
+            for e in geo_errors:
+                err_console.print(f"[red]GEOMETRY ERROR[/red]: {e}")
+            raise typer.Exit(1)
+        console.print("[green]Geometry OK[/green]")

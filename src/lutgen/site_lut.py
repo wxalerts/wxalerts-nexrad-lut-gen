@@ -6,7 +6,7 @@ import mercantile
 import numpy as np
 import pyproj
 
-from lutgen.geometry import pixel_to_polar
+from lutgen.geometry import aeqd_transformer, pixel_to_polar
 from lutgen.sites import Site
 from lutgen.tiles import tile_pixel_lonlat, tiles_in_coverage
 
@@ -37,6 +37,7 @@ def _compute_weights(
     site: Site,
     tile: mercantile.Tile,
     tile_size: int,
+    xfm: pyproj.Transformer,
     supersample: int = 4,
 ) -> np.ndarray:
     """4× supersample weight computation for zoom 8-9 tiles.
@@ -67,7 +68,7 @@ def _compute_weights(
     sub_lon = sub_lon.reshape(tile_size * sub, tile_size * sub)
     sub_lat = sub_lat.reshape(tile_size * sub, tile_size * sub)
 
-    sub_range_idx, sub_az_idx, sub_mask = pixel_to_polar(site, sub_lat, sub_lon)
+    sub_range_idx, sub_az_idx, sub_mask = pixel_to_polar(site, sub_lat, sub_lon, xfm)
 
     # Pack (range, az) into a single int64 key; -1 = out-of-coverage
     key = sub_range_idx.astype(np.int64) * 65536 + sub_az_idx.astype(np.int64)
@@ -136,7 +137,6 @@ def generate_site_lut(
     tile_size: int = 256,
 ) -> SiteLutResult:
     """Generate the per-site LUT for one (site, zoom) combination."""
-    from lutgen.geometry import aeqd_transformer
     xfm = aeqd_transformer(site)
 
     all_tiles = tiles_in_coverage(site, zoom)
@@ -151,7 +151,7 @@ def generate_site_lut(
 
     for tile in tiles:
         lon, lat = tile_pixel_lonlat(tile, tile_size)
-        range_idx, azimuth_idx, mask = pixel_to_polar(site, lat, lon)
+        range_idx, azimuth_idx, mask = pixel_to_polar(site, lat, lon, xfm)
 
         if mask.sum() == 0:
             continue
@@ -162,7 +162,7 @@ def generate_site_lut(
         mask_arrays.append(mask)
 
         if compute_weights:
-            weight_arrays.append(_compute_weights(site, tile, tile_size))
+            weight_arrays.append(_compute_weights(site, tile, tile_size, xfm))
 
     if not tile_indices:
         empty = np.zeros((0, tile_size, tile_size), dtype=np.uint16)

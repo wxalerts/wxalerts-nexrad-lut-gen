@@ -28,6 +28,7 @@ def pixel_to_polar(
     site: Site,
     pixel_lat: np.ndarray,
     pixel_lon: np.ndarray,
+    xfm: pyproj.Transformer | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Map pixel lat/lon arrays to (range_idx, azimuth_idx, mask).
 
@@ -36,7 +37,8 @@ def pixel_to_polar(
         azimuth_idx: uint16, index into the polar.zarr azimuth axis
         mask: uint8, 1 where pixel is within radar coverage, else 0
     """
-    xfm = aeqd_transformer(site)
+    if xfm is None:
+        xfm = aeqd_transformer(site)
     x_m, y_m = xfm.transform(pixel_lon, pixel_lat)
 
     range_m = np.sqrt(x_m**2 + y_m**2)
