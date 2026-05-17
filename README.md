@@ -69,7 +69,7 @@ docker run --rm \
   -e MINIO_ACCESS_KEY=... \
   -e MINIO_SECRET_KEY=... \
   -v /opt/nexrad-luts:/luts \
-  ghcr.io/cchance/wxalerts-nexrad-lut-gen:latest \
+  ghcr.io/wxalerts/wxalerts-nexrad-lut-gen:latest \
   sites generate --all --concurrency 8 --output-minio s3://nexrad-luts/
 ```
 

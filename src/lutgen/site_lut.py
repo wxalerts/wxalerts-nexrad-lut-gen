@@ -81,13 +81,8 @@ def _compute_weights(
            .reshape(tile_size, tile_size, n)
     )
 
-    # Vectorized mode: for each of the n sub-pixels, count how many of the n
-    # values in the same pixel equal it. Take the max count.
-    # Shape throughout: (tile_size, tile_size, n)
-    max_count = np.zeros((tile_size, tile_size), dtype=np.int32)
-    for i in range(n):
-        count = np.sum(key_r == key_r[:, :, i : i + 1], axis=-1)  # (H, W)
-        max_count = np.maximum(max_count, count)
+    # Pairwise equality across sub-pixels: (H, W, n, n) → count per pixel → max.
+    max_count = (key_r[:, :, :, None] == key_r[:, :, None, :]).sum(axis=-1).max(axis=-1)
 
     weights = (max_count / n).astype(np.float32)
     # Zero out fully-masked pixels
@@ -110,19 +105,11 @@ def _prefilter_tiles(
 
     # For each tile, clamp the site's lon/lat to the tile's bbox — that is
     # the nearest point of the bbox to the site.
-    west_arr = np.empty(len(tiles))
-    south_arr = np.empty(len(tiles))
-    east_arr = np.empty(len(tiles))
-    north_arr = np.empty(len(tiles))
-    for i, t in enumerate(tiles):
-        b = mercantile.bounds(t)
-        west_arr[i] = b.west
-        south_arr[i] = b.south
-        east_arr[i] = b.east
-        north_arr[i] = b.north
-
-    nearest_lon = np.clip(site.lon, west_arr, east_arr)
-    nearest_lat = np.clip(site.lat, south_arr, north_arr)
+    bounds_arr = np.array(
+        [(b.west, b.south, b.east, b.north) for b in (mercantile.bounds(t) for t in tiles)]
+    )
+    nearest_lon = np.clip(site.lon, bounds_arr[:, 0], bounds_arr[:, 2])
+    nearest_lat = np.clip(site.lat, bounds_arr[:, 1], bounds_arr[:, 3])
 
     x_m, y_m = xfm.transform(nearest_lon, nearest_lat)
     dist = np.sqrt(x_m**2 + y_m**2)
