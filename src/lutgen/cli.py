@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any
 
+import mercantile
 import numpy as np
 import typer
 from rich.console import Console
 from rich.table import Table
 
 from lutgen.config import Config
+from lutgen.geometry import aeqd_transformer
 from lutgen.sites import SITE_BY_ICAO, SITES
 
 app = typer.Typer(name="lutgen", help="NEXRAD LUT generator", no_args_is_help=True)
@@ -234,10 +237,6 @@ def verify(
         if site not in SITE_BY_ICAO:
             err_console.print(f"[red]Unknown site: {site}[/red]")
             raise typer.Exit(1)
-
-        import math
-        import mercantile
-        from lutgen.geometry import aeqd_transformer
 
         site_obj    = SITE_BY_ICAO[site]
         transformer = aeqd_transformer(site_obj)

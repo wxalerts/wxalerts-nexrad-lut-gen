@@ -9,7 +9,7 @@ import pyproj
 from lutgen.sites import Site
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def aeqd_transformer(site: Site) -> pyproj.Transformer:
     """Return a Transformer from WGS84 to AEQD centered on this site.
 
