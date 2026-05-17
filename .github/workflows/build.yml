@@ -9,7 +9,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: cchance/wxalerts-nexrad-lut-gen
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   test:
