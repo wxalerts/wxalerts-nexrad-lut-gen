@@ -4,6 +4,7 @@ Validates that the polar indices stored in a LUT are geometrically consistent
 with the tile's geographic position. No polar.zarr data needed — this checks
 the LUT against the geometry that should have produced it.
 """
+
 from __future__ import annotations
 
 import math
