@@ -17,7 +17,6 @@ import pytest
 from lutgen.geometry import aeqd_transformer
 from lutgen.sites import SITE_BY_ICAO, Site
 
-
 # ── geometry validation helpers ───────────────────────────────────────────────
 
 def _validate_lut_tile(
