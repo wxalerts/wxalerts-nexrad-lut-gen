@@ -51,8 +51,12 @@ def _run_site_zoom(
     zoom: int,
     config_dict: dict[str, Any],
     force: bool,
-) -> tuple[str, bool, str]:
-    """Worker: generate one (site, zoom) LUT. Returns (label, success, error)."""
+) -> tuple[str, bool, str, int, float, float]:
+    """Worker: generate + write one (site, zoom) LUT.
+
+    Returns (label, success, error, n_tiles, compute_s, upload_s).
+    n_tiles / compute_s / upload_s are 0 on skip or failure.
+    """
     from lutgen.config import Config
     from lutgen.sites import SITE_BY_ICAO
 
@@ -62,12 +66,19 @@ def _run_site_zoom(
         storage = LutStorage(config)
         site = SITE_BY_ICAO[icao]
         if not force and storage.exists("site", site=site, zoom=zoom):
-            return label, True, "skip"
-        result = generate_site_lut(site, zoom)
-        storage.write_site_lut(site, zoom, result.to_npz_dict())
-        return label, True, ""
+            return label, True, "skip", 0, 0.0, 0.0
+
+        t_compute = time.monotonic()
+        lut = generate_site_lut(site, zoom)
+        compute_s = time.monotonic() - t_compute
+
+        t_upload = time.monotonic()
+        storage.write_site_lut(site, zoom, lut.to_npz_dict())
+        upload_s = time.monotonic() - t_upload
+
+        return label, True, "", lut.tile_index.shape[0], compute_s, upload_s
     except Exception:
-        return label, False, traceback.format_exc()
+        return label, False, traceback.format_exc(), 0, 0.0, 0.0
 
 
 def _run_mosaic_zoom(
@@ -105,33 +116,34 @@ def _make_progress() -> Progress:
     )
 
 
+def _fmt(secs: float) -> str:
+    m, s = divmod(int(secs), 60)
+    return f"{m}:{s:02d}"
+
+
 def _render(
     progress: Progress,
-    submitted: dict[concurrent.futures.Future[Any], tuple[str, float]],
+    # ordered dict: label → (future, start_time) — insertion order = submission order
+    in_flight: dict[str, tuple[concurrent.futures.Future[Any], float]],
     log_lines: deque[str],
+    concurrency: int,
 ) -> Layout:
     now = time.monotonic()
 
-    # Running table — only futures the pool is actually executing
-    running: list[tuple[str, float]] = [
-        (label, now - t0)
-        for fut, (label, t0) in submitted.items()
-        if fut.running()
-    ]
-    running.sort(key=lambda x: x[1], reverse=True)  # longest-running first
+    # Use submission order: the first `concurrency` un-finished tasks are the
+    # ones most likely being executed right now.  Avoids the overcounting
+    # problem with fut.running() which fires before a worker actually starts.
+    items = [(lbl, t0) for lbl, (fut, t0) in in_flight.items() if not fut.done()]
+    running_items = items[:concurrency]
+    queued_count = max(0, len(items) - concurrency)
 
     tbl = Table(show_header=False, box=None, padding=(0, 1), expand=True)
     tbl.add_column(no_wrap=True)
     tbl.add_column(justify="right", no_wrap=True, style="dim")
-    for label, elapsed in running:
+    for label, t0 in running_items:
+        elapsed = now - t0
         color = "red" if elapsed > 300 else "yellow" if elapsed > 60 else "green"
-        mins, secs = divmod(int(elapsed), 60)
-        tbl.add_row(
-            f"[{color}]{label}[/{color}]",
-            f"{mins}:{secs:02d}",
-        )
-
-    pending = sum(1 for fut in submitted if not fut.done() and not fut.running())
+        tbl.add_row(f"[{color}]{label}[/{color}]", _fmt(elapsed))
 
     layout = Layout()
     layout.split_column(
@@ -145,8 +157,8 @@ def _render(
     layout["progress"].update(Panel(progress, padding=(0, 1)))
     layout["running"].update(Panel(
         tbl,
-        title=f"[cyan]Running ({len(running)})[/cyan]"
-              + (f"  [dim]+{pending} queued[/dim]" if pending else ""),
+        title=f"[cyan]Running ({len(running_items)})[/cyan]"
+              + (f"  [dim]+{queued_count} queued[/dim]" if queued_count else ""),
         border_style="cyan",
     ))
     layout["log"].update(Panel(
@@ -171,43 +183,54 @@ def generate_all_sites(
 
     tasks = [(site.icao, zoom) for site in sites for zoom in zooms]
     result = BatchResult()
-    log_lines: deque[str] = deque(maxlen=200)
-    submitted: dict[concurrent.futures.Future[Any], tuple[str, float]] = {}
+    log_lines: deque[str] = deque(maxlen=500)
+    # Ordered insertion so we can infer running vs queued by position
+    in_flight: dict[str, tuple[concurrent.futures.Future[Any], float]] = {}
 
     progress = _make_progress()
     task_id = progress.add_task("[cyan]Site LUTs", total=len(tasks))
 
     with (
-        Live(_render(progress, submitted, log_lines), refresh_per_second=4, screen=True) as live,
+        Live(_render(progress, in_flight, log_lines, concurrency), refresh_per_second=4, screen=True) as live,
         concurrent.futures.ProcessPoolExecutor(max_workers=concurrency) as pool,
     ):
-            for icao, zoom in tasks:
-                label = f"{icao}/z{zoom:02d}"
-                fut = pool.submit(_run_site_zoom, icao, zoom, config_dict, force)
-                submitted[fut] = (label, time.monotonic())
+        for icao, zoom in tasks:
+            label = f"{icao}/z{zoom:02d}"
+            fut = pool.submit(_run_site_zoom, icao, zoom, config_dict, force)
+            in_flight[label] = (fut, time.monotonic())
 
-            for fut in concurrent.futures.as_completed(submitted):
-                label, t0 = submitted[fut]
-                elapsed = time.monotonic() - t0
-                mins, secs = divmod(int(elapsed), 60)
-                dur = f"{mins}:{secs:02d}"
+        for fut in concurrent.futures.as_completed(f for _, (f, _) in in_flight.items()):
+            # Find label for this future
+            label = next(lbl for lbl, (f, _) in in_flight.items() if f is fut)
+            _, t0 = in_flight[label]
+            wall_s = time.monotonic() - t0
 
-                _, success, msg = fut.result()
-                if msg == "skip":
-                    result.skipped.append(label)
-                    log_lines.append(f"[dim]~ {label}[/dim]")
-                    log.debug("skipped", label=label)
-                elif success:
-                    result.succeeded.append(label)
-                    log_lines.append(f"[green]✓[/green] {label}  [dim]{dur}[/dim]")
-                    log.info("done", label=label, elapsed=dur)
-                else:
-                    result.failed.append((label, msg))
-                    log_lines.append(f"[red]✗ {label} FAILED[/red]")
-                    log.error("failed", label=label, error=msg)
+            _, success, msg, n_tiles, compute_s, upload_s = fut.result()
 
-                progress.advance(task_id)
-                live.update(_render(progress, submitted, log_lines))
+            if msg == "skip":
+                result.skipped.append(label)
+                # Don't clutter the log with skips — update description instead
+                progress.update(
+                    task_id,
+                    description=f"[cyan]Site LUTs[/cyan] [dim]({len(result.skipped)} skipped)[/dim]",
+                )
+            elif success:
+                result.succeeded.append(label)
+                rate = f"{n_tiles / compute_s:.0f} t/s" if compute_s > 0 else ""
+                log_lines.append(
+                    f"[green]✓[/green] {label}"
+                    f"  [dim]{_fmt(wall_s)}  {n_tiles} tiles"
+                    f"  compute {compute_s:.1f}s  upload {upload_s:.1f}s  {rate}[/dim]"
+                )
+                log.info("done", label=label, wall=_fmt(wall_s), tiles=n_tiles,
+                         compute_s=round(compute_s, 1), upload_s=round(upload_s, 1))
+            else:
+                result.failed.append((label, msg))
+                log_lines.append(f"[red bold]✗ {label} FAILED[/red bold]\n[red dim]{msg.strip()}[/red dim]")
+                log.error("failed", label=label, error=msg)
+
+            progress.advance(task_id)
+            live.update(_render(progress, in_flight, log_lines, concurrency))
 
     return result
 
