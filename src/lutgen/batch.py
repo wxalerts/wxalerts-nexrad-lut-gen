@@ -171,6 +171,16 @@ def _render(
 
 # ── public API ────────────────────────────────────────────────────────────────
 
+def _stats_line(result: BatchResult, n_running: int, elapsed_s: float) -> str:
+    return (
+        f"[dim]⟳ {_fmt(elapsed_s)}  "
+        f"✓ {len(result.succeeded)}  "
+        f"~ {len(result.skipped)} skipped  "
+        f"✗ {len(result.failed)}  "
+        f"{n_running} running[/dim]"
+    )
+
+
 def generate_all_sites(
     sites: list[Site],
     zooms: list[int],
@@ -183,12 +193,19 @@ def generate_all_sites(
 
     tasks = [(site.icao, zoom) for site in sites for zoom in zooms]
     result = BatchResult()
+    # First slot is always the live stats line; rest are event log entries
     log_lines: deque[str] = deque(maxlen=500)
-    # Ordered insertion so we can infer running vs queued by position
+    log_lines.append("")  # placeholder for stats line (index 0)
     in_flight: dict[str, tuple[concurrent.futures.Future[Any], float]] = {}
 
     progress = _make_progress()
     task_id = progress.add_task("[cyan]Site LUTs", total=len(tasks))
+    run_start = time.monotonic()
+
+    def _refresh(live: Live) -> None:
+        n_running = min(concurrency, sum(1 for _, (f, _) in in_flight.items() if not f.done()))
+        log_lines[0] = _stats_line(result, n_running, time.monotonic() - run_start)
+        live.update(_render(progress, in_flight, log_lines, concurrency))
 
     with (
         Live(_render(progress, in_flight, log_lines, concurrency), refresh_per_second=4, screen=True) as live,
@@ -199,8 +216,9 @@ def generate_all_sites(
             fut = pool.submit(_run_site_zoom, icao, zoom, config_dict, force)
             in_flight[label] = (fut, time.monotonic())
 
+        last_heartbeat = time.monotonic()
+
         for fut in concurrent.futures.as_completed(f for _, (f, _) in in_flight.items()):
-            # Find label for this future
             label = next(lbl for lbl, (f, _) in in_flight.items() if f is fut)
             _, t0 = in_flight[label]
             wall_s = time.monotonic() - t0
@@ -209,11 +227,8 @@ def generate_all_sites(
 
             if msg == "skip":
                 result.skipped.append(label)
-                # Don't clutter the log with skips — update description instead
-                progress.update(
-                    task_id,
-                    description=f"[cyan]Site LUTs[/cyan] [dim]({len(result.skipped)} skipped)[/dim]",
-                )
+                log_lines.append(f"[dim]~ {label}[/dim]")
+                log.debug("skipped", label=label)
             elif success:
                 result.succeeded.append(label)
                 rate = f"{n_tiles / compute_s:.0f} t/s" if compute_s > 0 else ""
@@ -230,7 +245,11 @@ def generate_all_sites(
                 log.error("failed", label=label, error=msg)
 
             progress.advance(task_id)
-            live.update(_render(progress, in_flight, log_lines, concurrency))
+
+            now = time.monotonic()
+            if msg != "skip" or now - last_heartbeat >= 5:
+                _refresh(live)
+                last_heartbeat = now
 
     return result
 
