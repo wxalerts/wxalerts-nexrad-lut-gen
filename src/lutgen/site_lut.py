@@ -6,11 +6,15 @@ import mercantile
 import numpy as np
 import pyproj
 
-from lutgen.geometry import aeqd_transformer, pixel_to_polar
+from lutgen.geometry import haversine_dist, pixel_to_polar
 from lutgen.sites import Site
 from lutgen.tiles import tile_pixel_lonlat, tiles_in_coverage
 
 _WEBMERC_TO_WGS84 = pyproj.Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
+
+# Tiles processed per pixel_to_polar call. Larger = fewer calls but more peak RAM.
+# At 64: ~67 MB lons+lats per worker; safe for 45 concurrent workers.
+_TILE_BATCH = 64
 
 
 @dataclass
@@ -37,7 +41,6 @@ def _compute_weights(
     site: Site,
     tile: mercantile.Tile,
     tile_size: int,
-    xfm: pyproj.Transformer,
     supersample: int = 4,
 ) -> np.ndarray:
     """4× supersample weight computation for zoom 8-9 tiles.
@@ -68,7 +71,7 @@ def _compute_weights(
     sub_lon = sub_lon.reshape(tile_size * sub, tile_size * sub)
     sub_lat = sub_lat.reshape(tile_size * sub, tile_size * sub)
 
-    sub_range_idx, sub_az_idx, sub_mask = pixel_to_polar(site, sub_lat, sub_lon, xfm)
+    sub_range_idx, sub_az_idx, sub_mask = pixel_to_polar(site, sub_lat, sub_lon)
 
     # Pack (range, az) into a single int64 key; -1 = out-of-coverage
     key = sub_range_idx.astype(np.int64) * 65536 + sub_az_idx.astype(np.int64)
@@ -92,29 +95,19 @@ def _compute_weights(
 
 
 def _prefilter_tiles(
-    site: Site, tiles: list[mercantile.Tile], xfm: pyproj.Transformer
+    site: Site, tiles: list[mercantile.Tile]
 ) -> list[mercantile.Tile]:
-    """Drop tiles whose nearest corner to the site is beyond max_range_m.
-
-    Projects the nearest point of each tile bbox to AEQD in one vectorized
-    batch, then keeps only tiles within coverage. This avoids the expensive
-    256×256 pixel_to_polar call for the majority of bbox tiles that lie
-    outside the radar's circular coverage area.
-    """
+    """Drop tiles whose nearest corner to the site is beyond max_range_m."""
     if not tiles:
         return tiles
 
-    # For each tile, clamp the site's lon/lat to the tile's bbox — that is
-    # the nearest point of the bbox to the site.
     bounds_arr = np.array(
         [(b.west, b.south, b.east, b.north) for b in (mercantile.bounds(t) for t in tiles)]
     )
     nearest_lon = np.clip(site.lon, bounds_arr[:, 0], bounds_arr[:, 2])
     nearest_lat = np.clip(site.lat, bounds_arr[:, 1], bounds_arr[:, 3])
 
-    x_m, y_m = xfm.transform(nearest_lon, nearest_lat)
-    dist = np.sqrt(x_m**2 + y_m**2)
-
+    dist = haversine_dist(site.lat, site.lon, nearest_lat, nearest_lon)
     return [t for t, d in zip(tiles, dist, strict=True) if d <= site.max_range_m]
 
 
@@ -124,10 +117,8 @@ def generate_site_lut(
     tile_size: int = 256,
 ) -> SiteLutResult:
     """Generate the per-site LUT for one (site, zoom) combination."""
-    xfm = aeqd_transformer(site)
-
     all_tiles = tiles_in_coverage(site, zoom)
-    tiles = _prefilter_tiles(site, all_tiles, xfm)
+    tiles = _prefilter_tiles(site, all_tiles)
 
     tile_indices: list[tuple[int, int]] = []
     range_arrays: list[np.ndarray] = []
@@ -136,20 +127,26 @@ def generate_site_lut(
     weight_arrays: list[np.ndarray] = []
     compute_weights = zoom in (8, 9)
 
-    for tile in tiles:
-        lon, lat = tile_pixel_lonlat(tile, tile_size)
-        range_idx, azimuth_idx, mask = pixel_to_polar(site, lat, lon, xfm)
+    for batch_start in range(0, len(tiles), _TILE_BATCH):
+        batch = tiles[batch_start : batch_start + _TILE_BATCH]
+        nb = len(batch)
 
-        if mask.sum() == 0:
-            continue
+        lons = np.empty((nb, tile_size, tile_size))
+        lats = np.empty((nb, tile_size, tile_size))
+        for j, tile in enumerate(batch):
+            lons[j], lats[j] = tile_pixel_lonlat(tile, tile_size)
 
-        tile_indices.append((tile.x, tile.y))
-        range_arrays.append(range_idx)
-        azimuth_arrays.append(azimuth_idx)
-        mask_arrays.append(mask)
+        r_idx, az_idx, msk = pixel_to_polar(site, lats, lons)
 
-        if compute_weights:
-            weight_arrays.append(_compute_weights(site, tile, tile_size, xfm))
+        for j, tile in enumerate(batch):
+            if not msk[j].any():
+                continue
+            tile_indices.append((tile.x, tile.y))
+            range_arrays.append(r_idx[j])
+            azimuth_arrays.append(az_idx[j])
+            mask_arrays.append(msk[j])
+            if compute_weights:
+                weight_arrays.append(_compute_weights(site, tile, tile_size))
 
     if not tile_indices:
         empty = np.zeros((0, tile_size, tile_size), dtype=np.uint16)

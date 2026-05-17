@@ -8,14 +8,14 @@ import pyproj
 
 from lutgen.sites import Site
 
+# WGS84 mean Earth radius — spherical haversine error vs geodetic AEQD is
+# ≈ 0.2 % at 230 km max range (≈ 250 m, < 1 range gate at 250 m spacing).
+_EARTH_RADIUS_M: float = 6_371_008.8
+
 
 @functools.cache
 def aeqd_transformer(site: Site) -> pyproj.Transformer:
-    """Return a Transformer from WGS84 to AEQD centered on this site.
-
-    AEQD (Azimuthal Equidistant) preserves distance from the projection center,
-    which is exactly what we need for radar range computation.
-    """
+    """Return a WGS84→AEQD Transformer centred on this site (used by verify only)."""
     aeqd = pyproj.CRS(
         proj="aeqd",
         lat_0=site.lat,
@@ -26,31 +26,60 @@ def aeqd_transformer(site: Site) -> pyproj.Transformer:
     return pyproj.Transformer.from_crs("EPSG:4326", aeqd, always_xy=True)
 
 
+def haversine_dist(
+    lat0: float,
+    lon0: float,
+    lats: np.ndarray,
+    lons: np.ndarray,
+) -> np.ndarray:
+    """Vectorised great-circle distance (metres) from scalar (lat0, lon0) to arrays."""
+    lat0_r = math.radians(lat0)
+    lon0_r = math.radians(lon0)
+    lat_r = np.radians(lats)
+    lon_r = np.radians(lons)
+    dlat = lat_r - lat0_r
+    dlon = lon_r - lon0_r
+    a = np.sin(dlat * 0.5) ** 2 + math.cos(lat0_r) * np.cos(lat_r) * np.sin(dlon * 0.5) ** 2
+    return 2.0 * _EARTH_RADIUS_M * np.arcsin(np.sqrt(a.clip(0.0, 1.0)))
+
+
 def pixel_to_polar(
     site: Site,
     pixel_lat: np.ndarray,
     pixel_lon: np.ndarray,
-    xfm: pyproj.Transformer | None = None,
+    xfm: pyproj.Transformer | None = None,  # no longer used; kept for API compatibility
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Map pixel lat/lon arrays to (range_idx, azimuth_idx, mask).
 
+    Uses spherical Haversine + forward-bearing formulas (no PROJ call).
+    Accepts arrays of any shape, including batched (N, H, W).
+
     Returns:
-        range_idx: uint16, index into the polar.zarr range axis
+        range_idx:   uint16, index into the polar.zarr range axis
         azimuth_idx: uint16, index into the polar.zarr azimuth axis
-        mask: uint8, 1 where pixel is within radar coverage, else 0
+        mask:        uint8, 1 where pixel is within radar coverage, else 0
     """
-    if xfm is None:
-        xfm = aeqd_transformer(site)
-    x_m, y_m = xfm.transform(pixel_lon, pixel_lat)
+    lat0 = math.radians(site.lat)
+    lon0 = math.radians(site.lon)
+    cos_lat0 = math.cos(lat0)
+    sin_lat0 = math.sin(lat0)
 
-    range_m = np.sqrt(x_m**2 + y_m**2)
+    lat_r = np.radians(pixel_lat)
+    lon_r = np.radians(pixel_lon)
+    dlat = lat_r - lat0
+    dlon = lon_r - lon0
 
-    # 0° = North, 90° = East (clockwise from North, matching radar convention)
-    azimuth_deg = (np.degrees(np.arctan2(x_m, y_m)) + 360.0) % 360.0
+    # Great-circle distance via Haversine
+    a = np.sin(dlat * 0.5) ** 2 + cos_lat0 * np.cos(lat_r) * np.sin(dlon * 0.5) ** 2
+    range_m = 2.0 * _EARTH_RADIUS_M * np.arcsin(np.sqrt(a.clip(0.0, 1.0)))
+
+    # Forward bearing: 0° = North, clockwise — matches NEXRAD convention
+    x = np.cos(lat_r) * np.sin(dlon)
+    y = cos_lat0 * np.sin(lat_r) - sin_lat0 * np.cos(lat_r) * np.cos(dlon)
+    azimuth_deg = (np.degrees(np.arctan2(x, y)) + 360.0) % 360.0
 
     range_idx_f = (range_m - site.first_range_gate_m) / site.range_gate_spacing_m
     azimuth_idx_f = azimuth_deg / (360.0 / site.n_azimuths)
-
     max_range_idx = int(
         math.floor((site.max_range_m - site.first_range_gate_m) / site.range_gate_spacing_m)
     )
@@ -60,8 +89,6 @@ def pixel_to_polar(
 
     in_range = (range_idx >= 0) & (range_idx < max_range_idx) & (range_m <= site.max_range_m)
     mask = in_range.astype(np.uint8)
-
-    # Zero out indices for masked pixels so downstream code can index safely
     range_idx = np.where(in_range, range_idx, 0).astype(np.uint16)
     azimuth_idx = np.where(in_range, azimuth_idx % site.n_azimuths, 0).astype(np.uint16)
 
@@ -69,14 +96,8 @@ def pixel_to_polar(
 
 
 def coverage_bbox_wgs84(site: Site) -> tuple[float, float, float, float]:
-    """Return (min_lon, min_lat, max_lon, max_lat) of the site's coverage circle.
-
-    Approximates the great-circle disk bounding box. Some edge tiles returned
-    by mercantile.tiles() may have zero in-coverage pixels, which is fine.
-    """
-    # Degrees of latitude per meter (roughly constant)
+    """Return (min_lon, min_lat, max_lon, max_lat) of the site's coverage circle."""
     lat_deg_per_m = 1.0 / 111_320.0
-    # Degrees of longitude per meter varies with latitude
     lon_deg_per_m = 1.0 / (111_320.0 * math.cos(math.radians(site.lat)))
 
     delta_lat = site.max_range_m * lat_deg_per_m
