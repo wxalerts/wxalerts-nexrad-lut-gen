@@ -32,6 +32,11 @@ from lutgen.storage import LutStorage
 
 log = structlog.get_logger()
 
+# z13 output arrays ≈ 3 GB/worker; z14 ≈ 10 GB/worker.
+# These caps keep peak RAM manageable on a typical 32-64 GB server.
+# All lower zooms run at the user-supplied --concurrency.
+_ZOOM_MAX_WORKERS: dict[int, int] = {13: 8, 14: 4}
+
 
 @dataclass
 class BatchResult:
@@ -51,7 +56,6 @@ def _run_site_zoom(
     zoom: int,
     config_dict: dict[str, Any],
     force: bool,
-    n_threads: int = 1,
 ) -> tuple[str, bool, str, int, float, float]:
     """Worker: generate + write one (site, zoom) LUT.
 
@@ -70,7 +74,7 @@ def _run_site_zoom(
             return label, True, "skip", 0, 0.0, 0.0
 
         t_compute = time.monotonic()
-        lut = generate_site_lut(site, zoom, n_threads=n_threads)
+        lut = generate_site_lut(site, zoom)
         compute_s = time.monotonic() - t_compute
 
         t_upload = time.monotonic()
@@ -122,18 +126,24 @@ def _fmt(secs: float) -> str:
     return f"{m}:{s:02d}"
 
 
+def _stats_line(result: BatchResult, n_running: int, elapsed_s: float) -> str:
+    return (
+        f"[dim]⟳ {_fmt(elapsed_s)}  "
+        f"✓ {len(result.succeeded)}  "
+        f"~ {len(result.skipped)} skipped  "
+        f"✗ {len(result.failed)}  "
+        f"{n_running} running[/dim]"
+    )
+
+
 def _render(
     progress: Progress,
-    # ordered dict: label → (future, start_time) — insertion order = submission order
     in_flight: dict[str, tuple[concurrent.futures.Future[Any], float]],
     log_lines: deque[str],
     concurrency: int,
 ) -> Layout:
     now = time.monotonic()
 
-    # Use submission order: the first `concurrency` un-finished tasks are the
-    # ones most likely being executed right now.  Avoids the overcounting
-    # problem with fut.running() which fires before a worker actually starts.
     items = [(lbl, t0) for lbl, (fut, t0) in in_flight.items() if not fut.done()]
     running_items = items[:concurrency]
     queued_count = max(0, len(items) - concurrency)
@@ -172,16 +182,6 @@ def _render(
 
 # ── public API ────────────────────────────────────────────────────────────────
 
-def _stats_line(result: BatchResult, n_running: int, elapsed_s: float) -> str:
-    return (
-        f"[dim]⟳ {_fmt(elapsed_s)}  "
-        f"✓ {len(result.succeeded)}  "
-        f"~ {len(result.skipped)} skipped  "
-        f"✗ {len(result.failed)}  "
-        f"{n_running} running[/dim]"
-    )
-
-
 def generate_all_sites(
     sites: list[Site],
     zooms: list[int],
@@ -192,71 +192,69 @@ def generate_all_sites(
     config_dict: dict[str, Any] = config.model_dump()
     config_dict["output_local_dir"] = str(config_dict["output_local_dir"])
 
-    # Zoom-major: all z10 → all z11 → … → all z14.
-    # Keeps workers on fast tasks first so progress is visible early,
-    # and avoids all 45 slots being consumed by slow z14 tasks immediately.
-    tasks = [(site.icao, zoom) for zoom in zooms for site in sites]
+    total_tasks = len(sites) * len(zooms)
     result = BatchResult()
-    # First slot is always the live stats line; rest are event log entries
     log_lines: deque[str] = deque(maxlen=500)
-    log_lines.append("")  # placeholder for stats line (index 0)
+    log_lines.append("")  # slot 0: live stats line
     in_flight: dict[str, tuple[concurrent.futures.Future[Any], float]] = {}
 
     progress = _make_progress()
-    task_id = progress.add_task("[cyan]Site LUTs", total=len(tasks))
+    task_id = progress.add_task("[cyan]Site LUTs", total=total_tasks)
     run_start = time.monotonic()
 
-    def _refresh(live: Live) -> None:
-        n_running = min(concurrency, sum(1 for _, (f, _) in in_flight.items() if not f.done()))
-        log_lines[0] = _stats_line(result, n_running, time.monotonic() - run_start)
-        live.update(_render(progress, in_flight, log_lines, concurrency))
+    with Live(_render(progress, in_flight, log_lines, concurrency), refresh_per_second=4, screen=True) as live:
+        # Process one zoom level at a time so we can cap concurrency for heavy
+        # zooms without letting all 45 workers simultaneously build 10 GB z14
+        # output arrays and OOM the machine.
+        for zoom in sorted(zooms):
+            zoom_workers = min(concurrency, _ZOOM_MAX_WORKERS.get(zoom, concurrency))
 
-    with (
-        Live(_render(progress, in_flight, log_lines, concurrency), refresh_per_second=4, screen=True) as live,
-        concurrent.futures.ProcessPoolExecutor(max_workers=concurrency) as pool,
-    ):
-        for icao, zoom in tasks:
-            label = f"{icao}/z{zoom:02d}"
-            # More threads for heavier zoom levels; numpy haversine releases the GIL
-            # so threads in a worker process run truly in parallel.
-            n_threads = 4 if zoom >= 13 else 2 if zoom >= 11 else 1
-            fut = pool.submit(_run_site_zoom, icao, zoom, config_dict, force, n_threads)
-            in_flight[label] = (fut, time.monotonic())
+            with concurrent.futures.ProcessPoolExecutor(max_workers=zoom_workers) as pool:
+                zoom_futures: dict[concurrent.futures.Future[Any], str] = {}
+                for site in sites:
+                    label = f"{site.icao}/z{zoom:02d}"
+                    fut = pool.submit(_run_site_zoom, site.icao, zoom, config_dict, force)
+                    zoom_futures[fut] = label
+                    in_flight[label] = (fut, time.monotonic())
 
-        last_heartbeat = time.monotonic()
+                last_heartbeat = time.monotonic()
 
-        for fut in concurrent.futures.as_completed(f for _, (f, _) in in_flight.items()):
-            label = next(lbl for lbl, (f, _) in in_flight.items() if f is fut)
-            _, t0 = in_flight[label]
-            wall_s = time.monotonic() - t0
+                for fut in concurrent.futures.as_completed(zoom_futures):
+                    label = zoom_futures[fut]
+                    _, t0 = in_flight.pop(label)  # remove from running display
+                    wall_s = time.monotonic() - t0
 
-            _, success, msg, n_tiles, compute_s, upload_s = fut.result()
+                    _, success, msg, n_tiles, compute_s, upload_s = fut.result()
 
-            if msg == "skip":
-                result.skipped.append(label)
-                log_lines.append(f"[dim]~ {label}[/dim]")
-                log.debug("skipped", label=label)
-            elif success:
-                result.succeeded.append(label)
-                rate = f"{n_tiles / compute_s:.0f} t/s" if compute_s > 0 else ""
-                log_lines.append(
-                    f"[green]✓[/green] {label}"
-                    f"  [dim]{_fmt(wall_s)}  {n_tiles} tiles"
-                    f"  compute {compute_s:.1f}s  upload {upload_s:.1f}s  {rate}[/dim]"
-                )
-                log.info("done", label=label, wall=_fmt(wall_s), tiles=n_tiles,
-                         compute_s=round(compute_s, 1), upload_s=round(upload_s, 1))
-            else:
-                result.failed.append((label, msg))
-                log_lines.append(f"[red bold]✗ {label} FAILED[/red bold]\n[red dim]{msg.strip()}[/red dim]")
-                log.error("failed", label=label, error=msg)
+                    if msg == "skip":
+                        result.skipped.append(label)
+                        log_lines.append(f"[dim]~ {label}[/dim]")
+                        log.debug("skipped", label=label)
+                    elif success:
+                        result.succeeded.append(label)
+                        rate = f"{n_tiles / compute_s:.0f} t/s" if compute_s > 0 else ""
+                        log_lines.append(
+                            f"[green]✓[/green] {label}"
+                            f"  [dim]{_fmt(wall_s)}  {n_tiles} tiles"
+                            f"  compute {compute_s:.1f}s  upload {upload_s:.1f}s  {rate}[/dim]"
+                        )
+                        log.info("done", label=label, wall=_fmt(wall_s), tiles=n_tiles,
+                                 compute_s=round(compute_s, 1), upload_s=round(upload_s, 1))
+                    else:
+                        result.failed.append((label, msg))
+                        log_lines.append(
+                            f"[red bold]✗ {label} FAILED[/red bold]\n[red dim]{msg.strip()}[/red dim]"
+                        )
+                        log.error("failed", label=label, error=msg)
 
-            progress.advance(task_id)
+                    progress.advance(task_id)
 
-            now = time.monotonic()
-            if msg != "skip" or now - last_heartbeat >= 5:
-                _refresh(live)
-                last_heartbeat = now
+                    now = time.monotonic()
+                    if msg != "skip" or now - last_heartbeat >= 5:
+                        n_running = min(zoom_workers, len(in_flight))
+                        log_lines[0] = _stats_line(result, n_running, now - run_start)
+                        live.update(_render(progress, in_flight, log_lines, zoom_workers))
+                        last_heartbeat = now
 
     return result
 

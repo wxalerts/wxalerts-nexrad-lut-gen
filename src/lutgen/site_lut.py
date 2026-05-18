@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import mercantile
@@ -138,27 +137,13 @@ def generate_site_lut(
     site: Site,
     zoom: int,
     tile_size: int = 256,
-    n_threads: int = 1,
 ) -> SiteLutResult:
-    """Generate the per-site LUT for one (site, zoom) combination.
-
-    n_threads > 1 processes tile batches concurrently. numpy haversine
-    operations release the GIL so threads genuinely run in parallel.
-    """
+    """Generate the per-site LUT for one (site, zoom) combination."""
     all_tiles = tiles_in_coverage(site, zoom)
     tiles = _prefilter_tiles(site, all_tiles)
 
     batches = [tiles[i : i + _TILE_BATCH] for i in range(0, len(tiles), _TILE_BATCH)]
-
-    if n_threads > 1 and len(batches) > 1:
-        with ThreadPoolExecutor(max_workers=n_threads) as tex:
-            # Submit all batches; collect in submission order to preserve tile ordering.
-            batch_results = [
-                f.result()
-                for f in [tex.submit(_process_batch, site, b, tile_size) for b in batches]
-            ]
-    else:
-        batch_results = [_process_batch(site, b, tile_size) for b in batches]
+    batch_results = [_process_batch(site, b, tile_size) for b in batches]
 
     tile_indices: list[tuple[int, int]] = []
     range_arrays: list[np.ndarray] = []
