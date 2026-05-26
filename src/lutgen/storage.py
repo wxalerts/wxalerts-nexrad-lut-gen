@@ -40,7 +40,7 @@ class LutStorage:
     # ── internal helpers ──────────────────────────────────────────────────────
 
     def _site_relpath(self, site: Site, zoom: int) -> str:
-        return f"sites/{site.icao}/z{zoom:02d}.npz"
+        return f"{site.icao}/z{zoom:02d}.npz"
 
     def _mosaic_relpath(self, zoom: int, part: int) -> str:
         if part == 0:
