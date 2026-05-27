@@ -26,10 +26,8 @@ from urllib.parse import urlparse
 
 # (lower_dbz_bound, R, G, B, A)
 _NWS_REFL_STOPS = [
-    (5,  0,   255, 255, 255),   # light cyan
-    (10, 0,   200, 255, 255),   # cyan
-    (15, 0,   0,   255, 255),   # blue
-    (20, 0,   100, 200, 255),   # green-blue
+    (15, 0,   0,   255,  80),   # faint blue — light drizzle (semi-transparent)
+    (20, 0,   100, 200, 255),   # light blue-green — light rain
     (25, 0,   200, 0,   255),   # green
     (30, 100, 220, 0,   255),   # yellow-green
     (35, 200, 220, 0,   255),   # yellow
