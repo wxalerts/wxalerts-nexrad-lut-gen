@@ -15,7 +15,7 @@ ENDPOINT     = "http://172.16.50.11:9000"
 ACCESS_KEY   = "O2MZXHLFBDC6YB55CDGE"
 SECRET_KEY   = "NjRuSMHhMgWEF864TmRxVB_AXi-VUzZCtzf8Jun3hEjkUITCHHsdFw"
 BUCKET       = "nexrad-lut"
-SOURCE_DIR   = Path("/home/cchance/Documents/GitHub/wxalerts-nexrad-lut-gen/nexrad-luts/sites")
+SOURCE_DIR   = Path("/home/cchance/Documents/GitHub/wxalerts-nexrad-lut-gen/nexrad-luts/")
 
 def main():
     s3 = boto3.client(
