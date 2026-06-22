@@ -29,6 +29,8 @@ lutgen sites generate --site KMOB --zoom 14 --output-local ./test-luts
 # Visualize
 python scripts/visualize_lut.py ./test-luts/sites/KMOB/z14.npz --tile 0
 
+source .venv/bin/activate && lutgen sites generate --all --zoom 1,2,3,4,5,6,7,8,9,10,11,12 --concurrency 8 --output-local /home/cchance/Documents/GitHub/wxalerts-nexrad-lut-gen/generated-luts > /tmp/lutgen-run.log 2>&1
+
 # All sites, dual-destination
 lutgen sites generate --all --concurrency 8 \
   --output-local /opt/nexrad-luts \
